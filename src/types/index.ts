@@ -26,7 +26,7 @@ export interface AppConfig {
   autoStart: boolean;
   monitorApps: boolean;
   theme: "light" | "dark" | "system";
-  notificationDurationSeconds: number;
+  notificationDurationMinutes: number;
 }
 
 export interface AppUsageRecord {

@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { motion, AnimatePresence } from "framer-motion";
+import { motion, AnimatePresence, Variants } from "framer-motion";
 import { useAppStore } from "../../stores/appStore";
 import type { Reminder } from "../../types";
 import { ReminderCard } from "./ReminderCard";
@@ -35,48 +35,69 @@ export function RemindersPage() {
     setEditingReminder(null);
   };
 
+  const containerVariants: Variants = {
+    hidden: { opacity: 0 },
+    show: {
+      opacity: 1,
+      transition: { staggerChildren: 0.1 }
+    }
+  };
+
   return (
-    <div>
-      <div className="flex items-center justify-between mb-6">
-        <h2 className="text-xl font-semibold">提醒管理</h2>
+    <div className="pb-10 h-full flex flex-col">
+      <div className="mb-8 flex flex-col md:flex-row md:items-end justify-between gap-6 pt-2">
+        <div>
+          <h2 className="text-2xl font-semibold tracking-tight text-main">Reminders</h2>
+          <p className="text-sm text-sub mt-1 tracking-wide font-light">管理你的日常专属提醒</p>
+        </div>
         <button
           onClick={() => {
             setEditingReminder(null);
             setShowForm(true);
           }}
-          className="px-4 py-2 bg-[var(--color-primary)] text-white rounded-lg text-sm font-medium hover:bg-[var(--color-primary-dark)] transition-colors"
+          className="px-6 py-3 bg-main text-[var(--color-background)] rounded-full text-sm font-medium hover:opacity-90 hover:shadow-float transition-all active:scale-[0.98] flex items-center justify-center gap-2 max-w-fit"
         >
-          + 添加提醒
+          <span className="text-xl font-light leading-none">+</span> Create
         </button>
       </div>
 
-      <div className="space-y-3">
-        <AnimatePresence>
-          {config.reminders.map((reminder) => (
-            <ReminderCard
-              key={reminder.id}
-              reminder={reminder}
-              onToggle={() => handleToggle(reminder.id)}
-              onEdit={() => {
-                setEditingReminder(reminder);
-                setShowForm(true);
-              }}
-              onDelete={() => handleDelete(reminder.id)}
-            />
-          ))}
-        </AnimatePresence>
-      </div>
-
-      {config.reminders.length === 0 && (
+      <div className="flex-1 overflow-y-auto pr-4 -mr-4">
         <motion.div
-          initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
-          className="text-center py-16 text-[var(--color-text-muted)]"
+          variants={containerVariants}
+          initial="hidden"
+          animate="show"
+          className="flex flex-col gap-3"
         >
-          <p className="text-4xl mb-3">🔔</p>
-          <p>还没有提醒，点击上方按钮添加</p>
+          <AnimatePresence mode="popLayout">
+            {config.reminders.map((reminder) => (
+              <ReminderCard
+                key={reminder.id}
+                reminder={reminder}
+                onToggle={() => handleToggle(reminder.id)}
+                onEdit={() => {
+                  setEditingReminder(reminder);
+                  setShowForm(true);
+                }}
+                onDelete={() => handleDelete(reminder.id)}
+              />
+            ))}
+          </AnimatePresence>
         </motion.div>
-      )}
+
+        {config.reminders.length === 0 && (
+          <motion.div
+            initial={{ opacity: 0, scale: 0.95 }}
+            animate={{ opacity: 1, scale: 1 }}
+            className="flex flex-col items-center justify-center h-64 text-center mt-10"
+          >
+            <div className="w-16 h-16 bg-glass rounded-full flex items-center justify-center text-3xl mb-4 shadow-soft">
+              ✨
+            </div>
+            <h3 className="text-lg font-medium tracking-tight text-main mb-1">Blank Slate</h3>
+            <p className="text-sub text-[13px] tracking-wide">添加你的第一个专属提醒</p>
+          </motion.div>
+        )}
+      </div>
 
       <AnimatePresence>
         {showForm && (

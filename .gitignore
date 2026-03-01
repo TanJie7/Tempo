@@ -24,3 +24,8 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Local debugging / assistant artifacts
+.claude/
+qa/
+notification.html

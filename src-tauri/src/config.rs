@@ -44,8 +44,16 @@ pub struct AppConfig {
     #[serde(rename = "monitorApps")]
     pub monitor_apps: bool,
     pub theme: String,
-    #[serde(rename = "notificationDurationSeconds")]
-    pub notification_duration_seconds: u32,
+    #[serde(
+        rename = "notificationDurationMinutes",
+        alias = "notificationDurationSeconds",
+        default = "default_notification_duration_minutes"
+    )]
+    pub notification_duration_minutes: u32,
+}
+
+fn default_notification_duration_minutes() -> u32 {
+    2
 }
 
 impl Default for AppConfig {
@@ -57,7 +65,7 @@ impl Default for AppConfig {
             auto_start: false,
             monitor_apps: false,
             theme: "system".to_string(),
-            notification_duration_seconds: 8,
+            notification_duration_minutes: default_notification_duration_minutes(),
         }
     }
 }
@@ -80,7 +88,21 @@ pub fn load_config() -> Result<AppConfig, String> {
         return Err("Config file not found".to_string());
     }
     let content = fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    serde_json::from_str(&content).map_err(|e| e.to_string())
+    let mut raw: serde_json::Value = serde_json::from_str(&content).map_err(|e| e.to_string())?;
+
+    // Backward-compatible migration from the old second-based field.
+    if raw.get("notificationDurationMinutes").is_none() {
+        let minutes = raw
+            .get("notificationDurationSeconds")
+            .and_then(|v| v.as_u64())
+            .map(|seconds| ((seconds + 59) / 60).clamp(1, 10) as u32)
+            .unwrap_or_else(default_notification_duration_minutes);
+        raw["notificationDurationMinutes"] = serde_json::json!(minutes);
+    }
+
+    let mut config: AppConfig = serde_json::from_value(raw).map_err(|e| e.to_string())?;
+    config.notification_duration_minutes = config.notification_duration_minutes.clamp(1, 10);
+    Ok(config)
 }
 
 pub fn save_config(config: &AppConfig) -> Result<(), String> {

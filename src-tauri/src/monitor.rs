@@ -135,6 +135,48 @@ pub fn get_daily_active_minutes(conn: &Connection, date: &str) -> u32 {
         / 60
 }
 
+fn period_key(period: &str, reference_date: &str) -> Option<String> {
+    match period {
+        "day" if reference_date.len() >= 10 => Some(reference_date[..10].to_string()),
+        "month" if reference_date.len() >= 7 => Some(reference_date[..7].to_string()),
+        "year" if reference_date.len() >= 4 => Some(reference_date[..4].to_string()),
+        _ => None,
+    }
+}
+
+pub fn get_active_minutes_by_period(conn: &Connection, period: &str, reference_date: &str) -> u32 {
+    let Some(key) = period_key(period, reference_date) else {
+        return 0;
+    };
+
+    let seconds: i64 = match period {
+        "day" => conn
+            .query_row(
+                "SELECT COALESCE(active_seconds, 0) FROM daily_usage WHERE date = ?1",
+                rusqlite::params![key],
+                |row| row.get(0),
+            )
+            .unwrap_or(0),
+        "month" => conn
+            .query_row(
+                "SELECT COALESCE(SUM(active_seconds), 0) FROM daily_usage WHERE substr(date, 1, 7) = ?1",
+                rusqlite::params![key],
+                |row| row.get(0),
+            )
+            .unwrap_or(0),
+        "year" => conn
+            .query_row(
+                "SELECT COALESCE(SUM(active_seconds), 0) FROM daily_usage WHERE substr(date, 1, 4) = ?1",
+                rusqlite::params![key],
+                |row| row.get(0),
+            )
+            .unwrap_or(0),
+        _ => 0,
+    };
+
+    (seconds.max(0) as u64 / 60) as u32
+}
+
 pub fn get_top_apps(conn: &Connection, date: &str, limit: u32) -> Vec<AppUsageEntry> {
     let mut stmt = match conn.prepare(
         "SELECT app_name, focus_seconds, date
@@ -158,4 +200,132 @@ pub fn get_top_apps(conn: &Connection, date: &str, limit: u32) -> Vec<AppUsageEn
     };
 
     rows.filter_map(|r| r.ok()).collect()
+}
+
+pub fn get_top_apps_by_period(
+    conn: &Connection,
+    period: &str,
+    reference_date: &str,
+    limit: u32,
+) -> Vec<AppUsageEntry> {
+    let Some(key) = period_key(period, reference_date) else {
+        return vec![];
+    };
+
+    if period == "day" {
+        return get_top_apps(conn, &key, limit);
+    }
+
+    let (sql, filter_key) = match period {
+        "month" => (
+            "SELECT app_name, SUM(focus_seconds) AS total_seconds
+             FROM app_usage
+             WHERE substr(date, 1, 7) = ?1
+             GROUP BY app_name
+             ORDER BY total_seconds DESC
+             LIMIT ?2",
+            key,
+        ),
+        "year" => (
+            "SELECT app_name, SUM(focus_seconds) AS total_seconds
+             FROM app_usage
+             WHERE substr(date, 1, 4) = ?1
+             GROUP BY app_name
+             ORDER BY total_seconds DESC
+             LIMIT ?2",
+            key,
+        ),
+        _ => return vec![],
+    };
+
+    let mut stmt = match conn.prepare(sql) {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+
+    let period_key_for_row = filter_key.clone();
+    let rows = match stmt.query_map(rusqlite::params![filter_key, limit], move |row| {
+        Ok(AppUsageEntry {
+            app_name: row.get(0)?,
+            focus_seconds: row.get(1)?,
+            date: period_key_for_row.clone(),
+        })
+    }) {
+        Ok(r) => r,
+        Err(_) => return vec![],
+    };
+
+    rows.filter_map(|r| r.ok()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn seeded_conn() -> Connection {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE app_usage (
+                app_name TEXT NOT NULL,
+                date TEXT NOT NULL,
+                focus_seconds INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (app_name, date)
+            );
+            CREATE TABLE daily_usage (
+                date TEXT PRIMARY KEY,
+                active_seconds INTEGER NOT NULL DEFAULT 0
+            );",
+        )
+        .expect("schema");
+
+        conn.execute(
+            "INSERT INTO daily_usage(date, active_seconds) VALUES
+                ('2026-03-01', 3600),
+                ('2026-03-02', 1800),
+                ('2026-02-28', 600),
+                ('2025-03-01', 7200)",
+            [],
+        )
+        .expect("seed daily");
+
+        conn.execute(
+            "INSERT INTO app_usage(app_name, date, focus_seconds) VALUES
+                ('Code.exe', '2026-03-01', 1800),
+                ('chrome.exe', '2026-03-01', 1200),
+                ('Code.exe', '2026-03-02', 600),
+                ('tempo.exe', '2026-03-02', 300),
+                ('chrome.exe', '2026-02-28', 1000),
+                ('yearApp.exe', '2025-03-01', 5000)",
+            [],
+        )
+        .expect("seed apps");
+
+        conn
+    }
+
+    #[test]
+    fn aggregates_active_minutes_by_period() {
+        let conn = seeded_conn();
+        assert_eq!(get_active_minutes_by_period(&conn, "day", "2026-03-01"), 60);
+        assert_eq!(get_active_minutes_by_period(&conn, "month", "2026-03-15"), 90);
+        assert_eq!(get_active_minutes_by_period(&conn, "year", "2026-08-12"), 100);
+    }
+
+    #[test]
+    fn aggregates_top_apps_by_period() {
+        let conn = seeded_conn();
+        let month = get_top_apps_by_period(&conn, "month", "2026-03-15", 3);
+        assert_eq!(month.len(), 3);
+        assert_eq!(month[0].app_name, "Code.exe");
+        assert_eq!(month[0].focus_seconds, 2400);
+        assert_eq!(month[1].app_name, "chrome.exe");
+        assert_eq!(month[1].focus_seconds, 1200);
+
+        let year = get_top_apps_by_period(&conn, "year", "2026-08-12", 3);
+        assert_eq!(year.len(), 3);
+        assert_eq!(year[0].app_name, "Code.exe");
+        assert_eq!(year[0].focus_seconds, 2400);
+        assert_eq!(year[1].app_name, "chrome.exe");
+        assert_eq!(year[1].focus_seconds, 2200);
+    }
 }

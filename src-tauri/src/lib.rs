@@ -9,15 +9,16 @@ use monitor::AppUsageEntry;
 use reminder::ReminderEngine;
 use std::sync::Mutex;
 use tauri::{
-    AppHandle, Emitter, Manager,
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    WebviewUrl, WebviewWindowBuilder,
+    AppHandle, Emitter, Manager,
 };
+use tauri_plugin_notification::NotificationExt;
 
 struct AppState {
     config: Mutex<AppConfig>,
     reminder_engine: ReminderEngine,
     db: Mutex<Option<rusqlite::Connection>>,
+    is_quitting: Mutex<bool>,
 }
 
 #[tauri::command]
@@ -75,59 +76,94 @@ fn get_top_apps(state: tauri::State<AppState>, date: String) -> Vec<AppUsageEntr
 }
 
 #[tauri::command]
+fn get_active_minutes_by_period(
+    state: tauri::State<AppState>,
+    period: String,
+    reference_date: String,
+) -> u32 {
+    let db = state.db.lock().unwrap();
+    if let Some(ref conn) = *db {
+        monitor::get_active_minutes_by_period(conn, &period, &reference_date)
+    } else {
+        0
+    }
+}
+
+#[tauri::command]
+fn get_top_apps_by_period(
+    state: tauri::State<AppState>,
+    period: String,
+    reference_date: String,
+) -> Vec<AppUsageEntry> {
+    let db = state.db.lock().unwrap();
+    if let Some(ref conn) = *db {
+        monitor::get_top_apps_by_period(conn, &period, &reference_date, 10)
+    } else {
+        vec![]
+    }
+}
+
+#[tauri::command]
+fn get_current_app_name() -> Option<String> {
+    monitor::get_foreground_app().map(|(app_name, _)| app_name)
+}
+
+#[tauri::command]
 fn reset_reminder_timer(state: tauri::State<AppState>, reminder_id: String) {
     state.reminder_engine.reset_timer(&reminder_id);
 }
 
-fn show_notification(app: &AppHandle, title: &str, description: Option<&str>, color: &str, duration: u32) {
-    let label = format!("notification-{}", uuid::Uuid::new_v4());
-
-    // Get primary monitor work area for bottom-left positioning
-    let (x, y) = get_notification_position(app);
-
-    let notification_url = WebviewUrl::App("index.html?notification=true".into());
-
-    if let Ok(win) = WebviewWindowBuilder::new(app, &label, notification_url)
-        .title("Tempo Notification")
-        .inner_size(320.0, 120.0)
-        .position(x, y)
-        .decorations(false)
-        .transparent(true)
-        .always_on_top(true)
-        .skip_taskbar(true)
-        .resizable(false)
-        .focused(false)
-        .build()
-    {
-        let payload = serde_json::json!({
-            "title": title,
-            "description": description,
-            "color": color,
-            "duration": duration
-        });
-
-        // Small delay to let the window load
-        let win_clone = win.clone();
-        let payload_clone = payload.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            let _ = win_clone.emit("show-notification", payload_clone);
-        });
-    }
+#[tauri::command]
+fn test_notification(
+    app: AppHandle,
+    title: String,
+    description: String,
+    color: String,
+    duration_minutes: u32,
+    theme: String,
+) {
+    let desc = if description.is_empty() {
+        None
+    } else {
+        Some(description.as_str())
+    };
+    show_notification(&app, &title, desc, &color, duration_minutes, &theme);
 }
 
-fn get_notification_position(app: &AppHandle) -> (f64, f64) {
-    // Default position: bottom-left, above taskbar
-    if let Some(window) = app.get_webview_window("main") {
-        if let Ok(Some(monitor)) = window.primary_monitor() {
-            let size = monitor.size();
-            let scale = monitor.scale_factor();
-            let x = 16.0;
-            let y = (size.height as f64 / scale) - 120.0 - 60.0; // 60px above taskbar
-            return (x, y);
-        }
+fn show_notification(
+    app: &AppHandle,
+    title: &str,
+    description: Option<&str>,
+    _color: &str,
+    duration_minutes: u32,
+    _theme: &str,
+) {
+    let body = description.unwrap_or("It is time to take a short break.");
+    if let Err(e) = app.notification().builder().title(title).body(body).show() {
+        eprintln!("Failed to show native notification: {}", e);
+        return;
     }
-    (16.0, 800.0) // fallback
+
+    // Native desktop notifications auto-dismiss quickly; re-fire to sustain visibility.
+    let repeat_count = duration_minutes.clamp(1, 10).saturating_sub(1);
+    if repeat_count == 0 {
+        return;
+    }
+
+    let app_handle = app.clone();
+    let title_owned = title.to_string();
+    let body_owned = body.to_string();
+    std::thread::spawn(move || {
+        for _ in 0..repeat_count {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            let _ = app_handle
+                .notification()
+                .builder()
+                .title(&title_owned)
+                .body(&body_owned)
+                .show();
+        }
+    });
 }
 
 fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
@@ -139,7 +175,10 @@ fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         .text("quit", "退出")
         .build()?;
 
+    let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/icon.png"))?;
+
     let _tray = TrayIconBuilder::new()
+        .icon(icon)
         .menu(&menu)
         .tooltip("Tempo")
         .on_menu_event(|app, event| match event.id().as_ref() {
@@ -150,10 +189,16 @@ fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             "quit" => {
+                let state = app.state::<AppState>();
+                *state.is_quitting.lock().unwrap() = true;
                 app.exit(0);
+
+                std::thread::spawn(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(900));
+                    std::process::exit(0);
+                });
             }
             "pause" => {
-                // Toggle pause - emit event to frontend
                 let _ = app.emit("toggle-pause", ());
             }
             _ => {}
@@ -180,64 +225,52 @@ fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
 fn start_background_tasks(app: AppHandle) {
     let app_handle = app.clone();
 
-    // Reminder check loop (every 30 seconds)
-    std::thread::spawn(move || {
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(30));
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_secs(30));
 
-            let state = app_handle.state::<AppState>();
-            let config = state.config.lock().unwrap().clone();
+        let state = app_handle.state::<AppState>();
+        let config = state.config.lock().unwrap().clone();
 
-            // Update idle state
-            idle::update_idle_state(config.idle_timeout_minutes);
-            let is_idle = idle::is_idle();
+        idle::update_idle_state(config.idle_timeout_minutes);
+        let is_idle = idle::is_idle();
 
-            // Check reminders
-            let to_fire = state.reminder_engine.check_reminders(&config, is_idle);
-            for reminder in to_fire {
-                show_notification(
-                    &app_handle,
-                    &reminder.title,
-                    reminder.description.as_deref(),
-                    &reminder.color,
-                    config.notification_duration_seconds,
-                );
-            }
+        let to_fire = state.reminder_engine.check_reminders(&config, is_idle);
+        for reminder in to_fire {
+            show_notification(
+                &app_handle,
+                &reminder.title,
+                reminder.description.as_deref(),
+                &reminder.color,
+                config.notification_duration_minutes,
+                &config.theme,
+            );
+        }
 
-            // Update daily usage (if not idle)
-            if !is_idle {
-                let db = state.db.lock().unwrap();
-                if let Some(ref conn) = *db {
-                    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-                    let _ = monitor::update_daily_usage(conn, &today, 30);
-                }
+        if !is_idle {
+            let db = state.db.lock().unwrap();
+            if let Some(ref conn) = *db {
+                let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+                let _ = monitor::update_daily_usage(conn, &today, 30);
             }
         }
     });
 
-    // App monitoring loop (every 2 seconds, if enabled)
     let app_handle2 = app.clone();
-    std::thread::spawn(move || {
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(2));
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_secs(2));
 
-            let state = app_handle2.state::<AppState>();
-            let config = state.config.lock().unwrap().clone();
+        let state = app_handle2.state::<AppState>();
+        let config = state.config.lock().unwrap().clone();
 
-            if !config.monitor_apps {
-                continue;
-            }
+        if !config.monitor_apps || idle::is_idle() {
+            continue;
+        }
 
-            if idle::is_idle() {
-                continue;
-            }
-
-            if let Some((app_name, _window_title)) = monitor::get_foreground_app() {
-                let db = state.db.lock().unwrap();
-                if let Some(ref conn) = *db {
-                    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-                    let _ = monitor::record_app_focus(conn, &app_name, 2, &today);
-                }
+        if let Some((app_name, _window_title)) = monitor::get_foreground_app() {
+            let db = state.db.lock().unwrap();
+            if let Some(ref conn) = *db {
+                let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+                let _ = monitor::record_app_focus(conn, &app_name, 2, &today);
             }
         }
     });
@@ -245,20 +278,19 @@ fn start_background_tasks(app: AppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Load initial config
     let initial_config = config::load_config().unwrap_or_default();
-
-    // Initialize database
     let db = monitor::init_db().ok();
 
     let state = AppState {
         config: Mutex::new(initial_config),
         reminder_engine: ReminderEngine::new(),
         db: Mutex::new(db),
+        is_quitting: Mutex::new(false),
     };
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_notification::init())
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             load_config,
@@ -269,26 +301,30 @@ pub fn run() {
             is_idle,
             get_today_active_minutes,
             get_top_apps,
+            get_active_minutes_by_period,
+            get_top_apps_by_period,
+            get_current_app_name,
             reset_reminder_timer,
+            test_notification,
         ])
         .setup(|app| {
-            // Setup system tray
             setup_tray(app.handle())?;
-
-            // Start background tasks
             start_background_tasks(app.handle().clone());
 
-            // Hide main window to tray on close
             let window = app.get_webview_window("main").unwrap();
             let window_clone = window.clone();
+            let app_handle = app.handle().clone();
             window.on_window_event(move |event| {
                 if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    let state = app_handle.state::<AppState>();
+                    if *state.is_quitting.lock().unwrap() {
+                        return;
+                    }
                     api.prevent_close();
                     let _ = window_clone.hide();
                 }
             });
 
-            // Check if launched with --minimized flag (auto-start)
             let args: Vec<String> = std::env::args().collect();
             if args.contains(&"--minimized".to_string()) {
                 let _ = window.hide();
@@ -299,3 +335,8 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running Tempo");
 }
+
+
+
+
+

@@ -57,7 +57,7 @@ const DEFAULT_CONFIG: AppConfig = {
   autoStart: false,
   monitorApps: false,
   theme: "system",
-  notificationDurationSeconds: 8,
+  notificationDurationMinutes: 2,
 };
 
 interface AppState {
@@ -98,9 +98,14 @@ export const useAppStore = create<AppState>((set, get) => ({
   loadConfig: async () => {
     try {
       const config = await invoke<AppConfig>("load_config");
-      set({ config });
+      const autoStart = await invoke<boolean>("get_auto_start_status");
+      const nextConfig = { ...config, autoStart };
+      set({ config: nextConfig });
+
+      if (config.autoStart !== autoStart) {
+        await invoke("save_config", { config: nextConfig });
+      }
     } catch {
-      // Use default config on first run
       await get().saveConfig();
     }
   },
