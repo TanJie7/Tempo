@@ -1,0 +1,53 @@
+{
+  "$schema": "https://raw.githubusercontent.com/nicegui/nicegui/main/.vscode/schema/tauri.conf.json",
+  "productName": "Tempo",
+  "version": "1.0.0",
+  "identifier": "com.tempo.app",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "Tempo",
+        "label": "main",
+        "width": 800,
+        "height": 560,
+        "minWidth": 700,
+        "minHeight": 480,
+        "center": true,
+        "decorations": true,
+        "resizable": true,
+        "visible": true
+      }
+    ],
+    "security": {
+      "csp": null
+    },
+    "trayIcon": {
+      "iconPath": "icons/icon.png",
+      "iconAsTemplate": false,
+      "tooltip": "Tempo"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.ico",
+      "icons/icon.png"
+    ],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    }
+  }
+}

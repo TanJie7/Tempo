@@ -1,0 +1,26 @@
+# Dependencies
+node_modules/
+
+# Rust build artifacts
+src-tauri/target/
+
+# Vite build output
+dist/
+
+# Runtime data (user config & database)
+data/
+
+# Generated files
+app-icon.svg
+generate-icon.js
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
