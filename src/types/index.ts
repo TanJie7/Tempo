@@ -40,6 +40,15 @@ export interface ReminderCountdown {
   blockedReason: "disabled" | "paused" | "idle" | "rest" | null | string;
 }
 
+export interface ReminderInteractionStats {
+  shown: number;
+  done: number;
+  snoozed: number;
+  missed: number;
+  avgResponseSeconds: number;
+  ignoredStreak: number;
+}
+
 export interface AppUsageRecord {
   date: string;
   activeMinutes: number;

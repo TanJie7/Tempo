@@ -5,6 +5,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
 interface NotificationData {
+  id: number;
+  reminderId: string;
   title: string;
   description?: string;
   color: string;
@@ -17,7 +19,9 @@ export function NotificationPopup() {
   const [visible, setVisible] = useState(false);
   const [progress, setProgress] = useState(100);
   const [loading, setLoading] = useState(true);
+  const [submitting, setSubmitting] = useState(false);
   const closeTimerRef = useRef<number | null>(null);
+  const handledNotificationRef = useRef<number | null>(null);
 
   useEffect(() => {
     document.documentElement.style.background = "transparent";
@@ -44,6 +48,8 @@ export function NotificationPopup() {
 
     const openPopup = (data: NotificationData) => {
       applyTheme(data.theme ?? "system");
+      handledNotificationRef.current = null;
+      setSubmitting(false);
       setNotification(data);
       setProgress(100);
       setLoading(false);
@@ -104,7 +110,7 @@ export function NotificationPopup() {
     }, 50);
 
     const timer = window.setTimeout(() => {
-      void closePopup();
+      void closePopup("missed");
     }, totalMs);
 
     return () => {
@@ -113,7 +119,29 @@ export function NotificationPopup() {
     };
   }, [visible, notification]);
 
-  const closePopup = async () => {
+  const submitAction = async (id: number, action: "done" | "snooze" | "missed") => {
+    if (handledNotificationRef.current === id) {
+      return;
+    }
+    handledNotificationRef.current = id;
+    try {
+      await invoke("submit_notification_action", {
+        notificationId: id,
+        action,
+      });
+    } catch (e) {
+      console.error("Failed to submit notification action:", e);
+    }
+  };
+
+  const closePopup = async (action: "done" | "snooze" | "missed" = "missed") => {
+    const currentId = notification?.id;
+    if (currentId !== undefined) {
+      setSubmitting(true);
+      await submitAction(currentId, action);
+      setSubmitting(false);
+    }
+
     setVisible(false);
     setLoading(false);
 
@@ -148,14 +176,12 @@ export function NotificationPopup() {
               backgroundColor: "var(--color-surface)",
               boxShadow: "0 10px 22px rgba(0,0,0,0.22)",
             }}
-            onClick={() => {
-              void closePopup();
-            }}
           >
             <div className="flex items-stretch relative z-10">
               <div className="w-2 flex-shrink-0" style={{ backgroundColor: notification.color }} />
 
-              <div className="p-3 flex-1 flex gap-3 items-start">
+              <div className="p-3 pb-2 flex-1 flex flex-col gap-2">
+                <div className="flex gap-3 items-start">
                 <div
                   className="w-9 h-9 rounded-lg flex items-center justify-center flex-shrink-0"
                   style={{ backgroundColor: `${notification.color}20`, color: notification.color }}
@@ -190,7 +216,7 @@ export function NotificationPopup() {
                 <button
                   onClick={(e) => {
                     e.stopPropagation();
-                    void closePopup();
+                    void closePopup("missed");
                   }}
                   className="w-7 h-7 rounded-full flex items-center justify-center transition-colors -mt-0.5 -mr-1 hover:bg-black/5 dark:hover:bg-white/10 text-muted"
                 >
@@ -209,6 +235,31 @@ export function NotificationPopup() {
                     <line x1="6" y1="6" x2="18" y2="18" />
                   </svg>
                 </button>
+              </div>
+
+                <div className="flex items-center justify-end gap-2 pl-11">
+                  <button
+                    disabled={submitting}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      void closePopup("snooze");
+                    }}
+                    className="h-8 px-3 rounded-lg border border-subtle text-[12px] text-sub hover:text-main transition-colors disabled:opacity-50"
+                  >
+                    拖延一次
+                  </button>
+                  <button
+                    disabled={submitting}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      void closePopup("done");
+                    }}
+                    className="h-8 px-3 rounded-lg text-[12px] font-semibold text-white transition-colors disabled:opacity-50"
+                    style={{ backgroundColor: notification.color }}
+                  >
+                    确认完成
+                  </button>
+                </div>
               </div>
             </div>
 

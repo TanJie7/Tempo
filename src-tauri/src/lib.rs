@@ -8,6 +8,7 @@ use config::AppConfig;
 use monitor::AppUsageEntry;
 use reminder::{ReminderCountdown, ReminderEngine};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Mutex,
@@ -22,6 +23,7 @@ const NOTIFICATION_WIDTH: f64 = 320.0;
 const NOTIFICATION_HEIGHT: f64 = 160.0;
 const NOTIFICATION_RIGHT_GAP: f64 = 28.0;
 const NOTIFICATION_BOTTOM_GAP: f64 = 86.0;
+const SNOOZE_MINUTES: u32 = 5;
 
 struct AppState {
     config: Mutex<AppConfig>,
@@ -29,17 +31,32 @@ struct AppState {
     db: Mutex<Option<rusqlite::Connection>>,
     is_quitting: Mutex<bool>,
     pending_notification: Mutex<Option<PopupNotificationPayload>>,
-    notification_seq: AtomicU64,
+    active_notifications: Mutex<HashMap<u64, ActiveNotification>>,
+    notification_counter: AtomicU64,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PopupNotificationPayload {
+    id: u64,
+    reminder_id: String,
     title: String,
     description: String,
     color: String,
     duration_seconds: u32,
     theme: String,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveNotification {
+    id: u64,
+    reminder_id: String,
+    title: String,
+    description: String,
+    color: String,
+    duration_seconds: u32,
+    theme: String,
+    shown_at: chrono::DateTime<chrono::Local>,
 }
 
 fn persist_reminders_paused(state: &tauri::State<AppState>, paused: bool) -> Result<(), String> {
@@ -48,6 +65,36 @@ fn persist_reminders_paused(state: &tauri::State<AppState>, paused: bool) -> Res
     config::save_config(&next_config)?;
     *state.config.lock().unwrap() = next_config;
     Ok(())
+}
+
+fn record_notification_event(
+    app: &AppHandle,
+    notification: &ActiveNotification,
+    event_type: &str,
+    response_seconds: Option<u32>,
+    snooze_minutes: Option<u32>,
+) {
+    let state = app.state::<AppState>();
+    let db = state.db.lock().unwrap();
+    let now = chrono::Local::now();
+    let shown_at = notification.shown_at.format("%Y-%m-%d %H:%M:%S").to_string();
+    let event_at = now.format("%Y-%m-%d %H:%M:%S").to_string();
+    let date = now.format("%Y-%m-%d").to_string();
+
+    if let Some(ref conn) = *db {
+        let _ = monitor::record_notification_event(
+            conn,
+            notification.id,
+            &notification.reminder_id,
+            &notification.title,
+            event_type,
+            &shown_at,
+            &event_at,
+            response_seconds,
+            snooze_minutes,
+            &date,
+        );
+    }
 }
 
 #[tauri::command]
@@ -152,8 +199,85 @@ fn get_top_apps_by_period(
 }
 
 #[tauri::command]
+fn get_reminder_interaction_stats_by_period(
+    state: tauri::State<AppState>,
+    period: String,
+    reference_date: String,
+) -> monitor::ReminderInteractionStats {
+    let db = state.db.lock().unwrap();
+    if let Some(ref conn) = *db {
+        monitor::get_reminder_interaction_stats_by_period(conn, &period, &reference_date)
+    } else {
+        monitor::ReminderInteractionStats::default()
+    }
+}
+
+#[tauri::command]
 fn get_current_app_name() -> Option<String> {
     monitor::get_foreground_app().map(|(app_name, _)| app_name)
+}
+
+#[tauri::command]
+fn submit_notification_action(
+    app: AppHandle,
+    state: tauri::State<AppState>,
+    notification_id: u64,
+    action: String,
+) -> Result<(), String> {
+    if !matches!(action.as_str(), "done" | "snooze" | "missed") {
+        return Err("Unsupported notification action".to_string());
+    }
+
+    let notification = {
+        let mut active = state.active_notifications.lock().unwrap();
+        active.remove(&notification_id)
+    };
+
+    let Some(notification) = notification else {
+        return Ok(());
+    };
+
+    let response_seconds = chrono::Local::now()
+        .signed_duration_since(notification.shown_at)
+        .num_seconds()
+        .max(0) as u32;
+
+    match action.as_str() {
+        "done" => {
+            record_notification_event(&app, &notification, "done", Some(response_seconds), None);
+        }
+        "snooze" => {
+            record_notification_event(
+                &app,
+                &notification,
+                "snooze",
+                Some(response_seconds),
+                Some(SNOOZE_MINUTES),
+            );
+
+            let app_handle = app.clone();
+            let snoozed = notification.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs((SNOOZE_MINUTES * 60) as u64));
+                let duration_minutes = (snoozed.duration_seconds / 60).clamp(1, 10);
+                show_notification(
+                    &app_handle,
+                    &snoozed.title,
+                    Some(&snoozed.description),
+                    &snoozed.color,
+                    duration_minutes,
+                    &snoozed.theme,
+                    &snoozed.reminder_id,
+                );
+            });
+        }
+        "missed" => {
+            record_notification_event(&app, &notification, "missed", Some(response_seconds), None);
+        }
+        _ => unreachable!(),
+    }
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -175,7 +299,15 @@ fn test_notification(
     } else {
         Some(description.as_str())
     };
-    show_notification(&app, &title, desc, &color, duration_minutes, &theme);
+    show_notification(
+        &app,
+        &title,
+        desc,
+        &color,
+        duration_minutes,
+        &theme,
+        "__test__",
+    );
 }
 
 fn ensure_notification_window(app: &AppHandle) -> Result<WebviewWindow, String> {
@@ -227,23 +359,44 @@ fn show_notification(
     color: &str,
     duration_minutes: u32,
     theme: &str,
+    reminder_id: &str,
 ) {
-    let payload = PopupNotificationPayload {
-        title: title.to_string(),
-        description: description
-            .unwrap_or("It is time to take a short break.")
-            .to_string(),
-        color: color.to_string(),
-        duration_seconds: duration_minutes.saturating_mul(60).clamp(5, 600),
-        theme: theme.to_string(),
-    };
+    let duration_seconds = duration_minutes.saturating_mul(60).clamp(5, 600);
+    let shown_at = chrono::Local::now();
 
-    let notification_seq = {
+    let (payload, active_notification) = {
         let state = app.state::<AppState>();
-        let seq = state.notification_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let id = state.notification_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        let payload = PopupNotificationPayload {
+            id,
+            reminder_id: reminder_id.to_string(),
+            title: title.to_string(),
+            description: description
+                .unwrap_or("It is time to take a short break.")
+                .to_string(),
+            color: color.to_string(),
+            duration_seconds,
+            theme: theme.to_string(),
+        };
+        let active = ActiveNotification {
+            id,
+            reminder_id: reminder_id.to_string(),
+            title: payload.title.clone(),
+            description: payload.description.clone(),
+            color: payload.color.clone(),
+            duration_seconds,
+            theme: payload.theme.clone(),
+            shown_at,
+        };
+        state
+            .active_notifications
+            .lock()
+            .unwrap()
+            .insert(id, active.clone());
         *state.pending_notification.lock().unwrap() = Some(payload.clone());
-        seq
+        (payload, active)
     };
+    record_notification_event(app, &active_notification, "shown", None, None);
 
     let window = match ensure_notification_window(app) {
         Ok(window) => window,
@@ -265,15 +418,39 @@ fn show_notification(
     }
 
     let app_handle = app.clone();
+    let notification_id = payload.id;
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_secs(
             payload.duration_seconds as u64 + 1,
         ));
-        let state = app_handle.state::<AppState>();
-        let latest = state.notification_seq.load(Ordering::Relaxed);
-        if latest == notification_seq {
-            if let Some(window) = app_handle.get_webview_window("notification") {
-                let _ = window.hide();
+
+        let timed_out_notification = {
+            let state = app_handle.state::<AppState>();
+            let mut active = state.active_notifications.lock().unwrap();
+            active.remove(&notification_id)
+        };
+
+        if let Some(notification) = timed_out_notification {
+            let response_seconds = chrono::Local::now()
+                .signed_duration_since(notification.shown_at)
+                .num_seconds()
+                .max(0) as u32;
+            record_notification_event(
+                &app_handle,
+                &notification,
+                "missed",
+                Some(response_seconds),
+                None,
+            );
+
+            let latest = app_handle
+                .state::<AppState>()
+                .notification_counter
+                .load(Ordering::Relaxed);
+            if latest == notification.id {
+                if let Some(window) = app_handle.get_webview_window("notification") {
+                    let _ = window.hide();
+                }
             }
         }
     });
@@ -363,6 +540,7 @@ fn start_background_tasks(app: AppHandle) {
                 &reminder.color,
                 config.notification_duration_minutes,
                 &config.theme,
+                &reminder.id,
             );
         }
 
@@ -407,7 +585,8 @@ pub fn run() {
         db: Mutex::new(db),
         is_quitting: Mutex::new(false),
         pending_notification: Mutex::new(None),
-        notification_seq: AtomicU64::new(0),
+        active_notifications: Mutex::new(HashMap::new()),
+        notification_counter: AtomicU64::new(0),
     };
 
     tauri::Builder::default()
@@ -433,7 +612,9 @@ pub fn run() {
             get_top_apps,
             get_active_minutes_by_period,
             get_top_apps_by_period,
+            get_reminder_interaction_stats_by_period,
             get_current_app_name,
+            submit_notification_action,
             reset_reminder_timer,
             test_notification,
         ])

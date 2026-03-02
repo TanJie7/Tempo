@@ -14,6 +14,17 @@ pub struct AppUsageEntry {
     pub date: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ReminderInteractionStats {
+    pub shown: u32,
+    pub done: u32,
+    pub snoozed: u32,
+    pub missed: u32,
+    pub avg_response_seconds: u32,
+    pub ignored_streak: u32,
+}
+
 pub fn get_foreground_app() -> Option<(String, String)> {
     unsafe {
         let hwnd = GetForegroundWindow();
@@ -92,7 +103,23 @@ pub fn init_db() -> Result<Connection, String> {
         CREATE TABLE IF NOT EXISTS daily_usage (
             date TEXT PRIMARY KEY,
             active_seconds INTEGER NOT NULL DEFAULT 0
-        );",
+        );
+        CREATE TABLE IF NOT EXISTS notification_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            notification_id INTEGER NOT NULL,
+            reminder_id TEXT NOT NULL,
+            title TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            shown_at TEXT NOT NULL,
+            event_at TEXT NOT NULL,
+            response_seconds INTEGER,
+            snooze_minutes INTEGER,
+            date TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_notification_events_date
+            ON notification_events(date);
+        CREATE INDEX IF NOT EXISTS idx_notification_events_event_at
+            ON notification_events(event_at);",
     )
     .map_err(|e| e.to_string())?;
 
@@ -258,6 +285,154 @@ pub fn get_top_apps_by_period(
     rows.filter_map(|r| r.ok()).collect()
 }
 
+pub fn record_notification_event(
+    conn: &Connection,
+    notification_id: u64,
+    reminder_id: &str,
+    title: &str,
+    event_type: &str,
+    shown_at: &str,
+    event_at: &str,
+    response_seconds: Option<u32>,
+    snooze_minutes: Option<u32>,
+    date: &str,
+) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO notification_events (
+            notification_id, reminder_id, title, event_type, shown_at, event_at,
+            response_seconds, snooze_minutes, date
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        rusqlite::params![
+            notification_id as i64,
+            reminder_id,
+            title,
+            event_type,
+            shown_at,
+            event_at,
+            response_seconds,
+            snooze_minutes,
+            date
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+pub fn get_reminder_interaction_stats_by_period(
+    conn: &Connection,
+    period: &str,
+    reference_date: &str,
+) -> ReminderInteractionStats {
+    let Some(key) = period_key(period, reference_date) else {
+        return ReminderInteractionStats::default();
+    };
+
+    let (sql, filter_key) = match period {
+        "day" => (
+            "SELECT
+                COALESCE(SUM(CASE WHEN event_type = 'shown' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN event_type = 'done' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN event_type = 'snooze' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN event_type = 'missed' THEN 1 ELSE 0 END), 0),
+                AVG(response_seconds)
+             FROM notification_events
+             WHERE date = ?1",
+            key.clone(),
+        ),
+        "month" => (
+            "SELECT
+                COALESCE(SUM(CASE WHEN event_type = 'shown' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN event_type = 'done' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN event_type = 'snooze' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN event_type = 'missed' THEN 1 ELSE 0 END), 0),
+                AVG(response_seconds)
+             FROM notification_events
+             WHERE substr(date, 1, 7) = ?1",
+            key.clone(),
+        ),
+        "year" => (
+            "SELECT
+                COALESCE(SUM(CASE WHEN event_type = 'shown' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN event_type = 'done' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN event_type = 'snooze' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN event_type = 'missed' THEN 1 ELSE 0 END), 0),
+                AVG(response_seconds)
+             FROM notification_events
+             WHERE substr(date, 1, 4) = ?1",
+            key.clone(),
+        ),
+        _ => return ReminderInteractionStats::default(),
+    };
+
+    let (shown, done, snoozed, missed, avg_response) = conn
+        .query_row(sql, rusqlite::params![filter_key], |row| {
+            Ok((
+                row.get::<_, u32>(0)?,
+                row.get::<_, u32>(1)?,
+                row.get::<_, u32>(2)?,
+                row.get::<_, u32>(3)?,
+                row.get::<_, Option<f64>>(4)?,
+            ))
+        })
+        .unwrap_or((0, 0, 0, 0, None));
+
+    let ignored_streak = {
+        let (streak_sql, streak_key) = match period {
+            "day" => (
+                "SELECT event_type
+                 FROM notification_events
+                 WHERE date = ?1 AND event_type IN ('done','snooze','missed')
+                 ORDER BY event_at DESC, id DESC
+                 LIMIT 50",
+                key.clone(),
+            ),
+            "month" => (
+                "SELECT event_type
+                 FROM notification_events
+                 WHERE substr(date, 1, 7) = ?1 AND event_type IN ('done','snooze','missed')
+                 ORDER BY event_at DESC, id DESC
+                 LIMIT 50",
+                key.clone(),
+            ),
+            "year" => (
+                "SELECT event_type
+                 FROM notification_events
+                 WHERE substr(date, 1, 4) = ?1 AND event_type IN ('done','snooze','missed')
+                 ORDER BY event_at DESC, id DESC
+                 LIMIT 50",
+                key.clone(),
+            ),
+            _ => return ReminderInteractionStats::default(),
+        };
+
+        let mut streak = 0u32;
+        if let Ok(mut stmt) = conn.prepare(streak_sql) {
+            if let Ok(rows) = stmt.query_map(rusqlite::params![streak_key], |row| {
+                row.get::<_, String>(0)
+            }) {
+                for item in rows.filter_map(|r| r.ok()) {
+                    if item == "missed" {
+                        streak += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+        streak
+    };
+
+    ReminderInteractionStats {
+        shown,
+        done,
+        snoozed,
+        missed,
+        avg_response_seconds: avg_response.unwrap_or(0.0).round().max(0.0) as u32,
+        ignored_streak,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,6 +449,18 @@ mod tests {
             CREATE TABLE daily_usage (
                 date TEXT PRIMARY KEY,
                 active_seconds INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE notification_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                notification_id INTEGER NOT NULL,
+                reminder_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                shown_at TEXT NOT NULL,
+                event_at TEXT NOT NULL,
+                response_seconds INTEGER,
+                snooze_minutes INTEGER,
+                date TEXT NOT NULL
             );",
         )
         .expect("schema");
@@ -327,5 +514,64 @@ mod tests {
         assert_eq!(year[0].focus_seconds, 2400);
         assert_eq!(year[1].app_name, "chrome.exe");
         assert_eq!(year[1].focus_seconds, 2200);
+    }
+
+    #[test]
+    fn aggregates_reminder_interaction_stats() {
+        let conn = seeded_conn();
+        conn.execute(
+            "INSERT INTO notification_events(
+                notification_id, reminder_id, title, event_type, shown_at, event_at,
+                response_seconds, snooze_minutes, date
+            ) VALUES
+                (1, 'r1', '喝水', 'shown',  '2026-03-02 09:00:00', '2026-03-02 09:00:00', NULL, NULL, '2026-03-02'),
+                (1, 'r1', '喝水', 'done',   '2026-03-02 09:00:00', '2026-03-02 09:00:15', 15, NULL, '2026-03-02'),
+                (2, 'r2', '走走', 'shown',  '2026-03-02 10:00:00', '2026-03-02 10:00:00', NULL, NULL, '2026-03-02'),
+                (2, 'r2', '走走', 'snooze', '2026-03-02 10:00:00', '2026-03-02 10:00:40', 40, 5, '2026-03-02'),
+                (3, 'r3', '休息', 'shown',  '2026-03-02 11:00:00', '2026-03-02 11:00:00', NULL, NULL, '2026-03-02'),
+                (3, 'r3', '休息', 'missed', '2026-03-02 11:00:00', '2026-03-02 11:01:00', 60, NULL, '2026-03-02'),
+                (4, 'r4', '复盘', 'shown',  '2026-03-02 12:00:00', '2026-03-02 12:00:00', NULL, NULL, '2026-03-02'),
+                (4, 'r4', '复盘', 'missed', '2026-03-02 12:00:00', '2026-03-02 12:00:55', 55, NULL, '2026-03-02')",
+            [],
+        )
+        .expect("seed notification events");
+
+        let stats = get_reminder_interaction_stats_by_period(&conn, "day", "2026-03-02");
+        assert_eq!(stats.shown, 4);
+        assert_eq!(stats.done, 1);
+        assert_eq!(stats.snoozed, 1);
+        assert_eq!(stats.missed, 2);
+        assert_eq!(stats.ignored_streak, 2);
+        assert!(stats.avg_response_seconds >= 40);
+    }
+
+    #[test]
+    fn reminder_interaction_stats_respect_selected_period() {
+        let conn = seeded_conn();
+        conn.execute(
+            "INSERT INTO notification_events(
+                notification_id, reminder_id, title, event_type, shown_at, event_at,
+                response_seconds, snooze_minutes, date
+            ) VALUES
+                (11, 'r1', '喝水', 'shown',  '2026-03-10 09:00:00', '2026-03-10 09:00:00', NULL, NULL, '2026-03-10'),
+                (11, 'r1', '喝水', 'done',   '2026-03-10 09:00:00', '2026-03-10 09:00:30', 30, NULL, '2026-03-10'),
+                (12, 'r2', '走走', 'shown',  '2026-03-12 10:00:00', '2026-03-12 10:00:00', NULL, NULL, '2026-03-12'),
+                (12, 'r2', '走走', 'missed', '2026-03-12 10:00:00', '2026-03-12 10:00:20', 20, NULL, '2026-03-12'),
+                (13, 'r3', '休息', 'shown',  '2026-04-01 08:00:00', '2026-04-01 08:00:00', NULL, NULL, '2026-04-01'),
+                (13, 'r3', '休息', 'missed', '2026-04-01 08:00:00', '2026-04-01 08:01:00', 60, NULL, '2026-04-01')",
+            [],
+        )
+        .expect("seed period-scoped notification events");
+
+        let march = get_reminder_interaction_stats_by_period(&conn, "month", "2026-03-20");
+        assert_eq!(march.shown, 2);
+        assert_eq!(march.done, 1);
+        assert_eq!(march.missed, 1);
+        assert_eq!(march.avg_response_seconds, 25);
+
+        let year = get_reminder_interaction_stats_by_period(&conn, "year", "2026-09-01");
+        assert_eq!(year.shown, 3);
+        assert_eq!(year.done, 1);
+        assert_eq!(year.missed, 2);
     }
 }

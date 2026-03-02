@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { motion, Variants } from "framer-motion";
 import { useAppStore } from "../../stores/appStore";
+import type { ReminderInteractionStats } from "../../types";
 
 interface TopAppEntry {
   app_name: string;
@@ -55,6 +56,14 @@ export function DashboardPage() {
   const [loadingApps, setLoadingApps] = useState(false);
   const [period, setPeriod] = useState<Period>("day");
   const [activeMinutes, setActiveMinutes] = useState(0);
+  const [interactionStats, setInteractionStats] = useState<ReminderInteractionStats>({
+    shown: 0,
+    done: 0,
+    snoozed: 0,
+    missed: 0,
+    avgResponseSeconds: 0,
+    ignoredStreak: 0,
+  });
   const today = useMemo(() => todayDate(), []);
   const [selectedDay, setSelectedDay] = useState(today);
   const [selectedMonth, setSelectedMonth] = useState(today.slice(0, 7));
@@ -77,6 +86,8 @@ export function DashboardPage() {
   }, [period, safeDay, safeMonth, safeYear]);
 
   const periodText = period === "day" ? "当日" : period === "month" ? "当月" : "当年";
+  const completionRate =
+    interactionStats.shown > 0 ? Math.round((interactionStats.done / interactionStats.shown) * 100) : 0;
 
   useEffect(() => {
     let cancelled = false;
@@ -101,6 +112,36 @@ export function DashboardPage() {
     const timer = window.setInterval(() => {
       void refreshActiveMinutes();
     }, 15000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [period, referenceDate]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const refreshInteractionStats = async () => {
+      try {
+        const stats = await invoke<ReminderInteractionStats>("get_reminder_interaction_stats_by_period", {
+          period,
+          referenceDate,
+        });
+        if (!cancelled) {
+          setInteractionStats(stats);
+        }
+      } catch (e) {
+        if (!cancelled) {
+          console.error("Failed to load reminder interaction stats:", e);
+        }
+      }
+    };
+
+    void refreshInteractionStats();
+    const timer = window.setInterval(() => {
+      void refreshInteractionStats();
+    }, 8000);
 
     return () => {
       cancelled = true;
@@ -210,7 +251,7 @@ export function DashboardPage() {
         variants={containerVariants}
         initial="hidden"
         animate="show"
-        className="grid grid-cols-2 gap-6 mb-12"
+        className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-12"
       >
         <motion.div
           variants={itemVariants}
@@ -247,6 +288,27 @@ export function DashboardPage() {
               {config.reminders.filter((r) => r.enabled).length}
               <span className="text-sm font-normal opacity-60 ml-2 tracking-normal uppercase">Active</span>
             </p>
+          </div>
+        </motion.div>
+
+        <motion.div
+          variants={itemVariants}
+          className="relative overflow-hidden rounded-2xl bg-glass border border-subtle p-6 shadow-soft group hover:shadow-float transition-all duration-500"
+        >
+          <div className="relative z-10">
+            <div className="flex items-center gap-3 mb-2 opacity-80">
+              <span className="text-xl">✅</span>
+              <p className="text-xs font-medium tracking-wider uppercase text-sub">提醒反馈</p>
+            </div>
+            <p className="text-4xl font-semibold text-main mt-4 tracking-tight">
+              {completionRate}
+              <span className="text-lg font-normal opacity-60 ml-1">%</span>
+            </p>
+            <div className="mt-3 text-xs text-sub leading-6">
+              <div>展示 {interactionStats.shown}</div>
+              <div>完成 {interactionStats.done} · 拖延 {interactionStats.snoozed} · 忽略 {interactionStats.missed}</div>
+              <div>平均响应 {interactionStats.avgResponseSeconds}s · 连续忽略 {interactionStats.ignoredStreak}</div>
+            </div>
           </div>
         </motion.div>
       </motion.div>
