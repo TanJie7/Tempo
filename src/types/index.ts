@@ -25,8 +25,19 @@ export interface AppConfig {
   idleTimeoutMinutes: number;
   autoStart: boolean;
   monitorApps: boolean;
+  remindersPaused: boolean;
   theme: "light" | "dark" | "system";
   notificationDurationMinutes: number;
+}
+
+export interface ReminderCountdown {
+  id: string;
+  title: string;
+  color: string;
+  reminderType: "interval" | "scheduled" | string;
+  enabled: boolean;
+  nextInSeconds: number | null;
+  blockedReason: "disabled" | "paused" | "idle" | "rest" | null | string;
 }
 
 export interface AppUsageRecord {

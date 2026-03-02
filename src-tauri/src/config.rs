@@ -43,6 +43,8 @@ pub struct AppConfig {
     pub auto_start: bool,
     #[serde(rename = "monitorApps")]
     pub monitor_apps: bool,
+    #[serde(rename = "remindersPaused", default)]
+    pub reminders_paused: bool,
     pub theme: String,
     #[serde(
         rename = "notificationDurationMinutes",
@@ -64,6 +66,7 @@ impl Default for AppConfig {
             idle_timeout_minutes: 10,
             auto_start: false,
             monitor_apps: false,
+            reminders_paused: false,
             theme: "system".to_string(),
             notification_duration_minutes: default_notification_duration_minutes(),
         }

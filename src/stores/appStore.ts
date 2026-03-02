@@ -56,6 +56,7 @@ const DEFAULT_CONFIG: AppConfig = {
   idleTimeoutMinutes: 10,
   autoStart: false,
   monitorApps: false,
+  remindersPaused: false,
   theme: "system",
   notificationDurationMinutes: 2,
 };
@@ -100,7 +101,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       const config = await invoke<AppConfig>("load_config");
       const autoStart = await invoke<boolean>("get_auto_start_status");
       const nextConfig = { ...config, autoStart };
-      set({ config: nextConfig });
+      set({ config: nextConfig, isPaused: nextConfig.remindersPaused });
 
       if (config.autoStart !== autoStart) {
         await invoke("save_config", { config: nextConfig });

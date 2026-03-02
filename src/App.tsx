@@ -46,7 +46,7 @@ function App() {
 }
 
 function MainApp() {
-  const { currentPage, loadConfig, config, setTodayActiveMinutes, setPaused } =
+  const { currentPage, loadConfig, config, setTodayActiveMinutes, setPaused, setConfig } =
     useAppStore();
   const [loaded, setLoaded] = useState(false);
 
@@ -75,25 +75,44 @@ function MainApp() {
   }, [setTodayActiveMinutes]);
 
   useEffect(() => {
-    let unlisten: (() => void) | undefined;
+    let unlistenPauseState: (() => void) | undefined;
+    let unlistenToggle: (() => void) | undefined;
 
     const setup = async () => {
       try {
-        unlisten = await listen("toggle-pause", () => {
-          const current = useAppStore.getState().isPaused;
-          setPaused(!current);
+        unlistenPauseState = await listen<boolean>("pause-state-changed", (event) => {
+          const paused = Boolean(event.payload);
+          const currentConfig = useAppStore.getState().config;
+          setConfig({ ...currentConfig, remindersPaused: paused });
+          setPaused(paused);
+        });
+
+        unlistenToggle = await listen("toggle-pause", () => {
+          const applyToggle = async () => {
+            const currentConfig = useAppStore.getState().config;
+            const nextPaused = !currentConfig.remindersPaused;
+            try {
+              await invoke("set_reminders_paused", { paused: nextPaused });
+              setConfig({ ...currentConfig, remindersPaused: nextPaused });
+              setPaused(nextPaused);
+            } catch (e) {
+              console.error("Failed to toggle pause state:", e);
+            }
+          };
+          void applyToggle();
         });
       } catch (e) {
-        console.error("Failed to listen toggle-pause event:", e);
+        console.error("Failed to listen pause events:", e);
       }
     };
 
     void setup();
 
     return () => {
-      unlisten?.();
+      unlistenPauseState?.();
+      unlistenToggle?.();
     };
-  }, [setPaused]);
+  }, [setConfig, setPaused]);
 
   if (!loaded) {
     return (

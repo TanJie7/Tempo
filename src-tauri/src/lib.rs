@@ -6,19 +6,48 @@ mod reminder;
 
 use config::AppConfig;
 use monitor::AppUsageEntry;
-use reminder::ReminderEngine;
-use std::sync::Mutex;
-use tauri::{
-    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Emitter, Manager,
+use reminder::{ReminderCountdown, ReminderEngine};
+use serde::Serialize;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Mutex,
 };
-use tauri_plugin_notification::NotificationExt;
+use tauri::{
+    LogicalPosition, LogicalSize, WebviewUrl,
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    AppHandle, Emitter, Manager, WebviewWindow, WebviewWindowBuilder,
+};
+
+const NOTIFICATION_WIDTH: f64 = 320.0;
+const NOTIFICATION_HEIGHT: f64 = 160.0;
+const NOTIFICATION_RIGHT_GAP: f64 = 28.0;
+const NOTIFICATION_BOTTOM_GAP: f64 = 86.0;
 
 struct AppState {
     config: Mutex<AppConfig>,
     reminder_engine: ReminderEngine,
     db: Mutex<Option<rusqlite::Connection>>,
     is_quitting: Mutex<bool>,
+    pending_notification: Mutex<Option<PopupNotificationPayload>>,
+    notification_seq: AtomicU64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PopupNotificationPayload {
+    title: String,
+    description: String,
+    color: String,
+    duration_seconds: u32,
+    theme: String,
+}
+
+fn persist_reminders_paused(state: &tauri::State<AppState>, paused: bool) -> Result<(), String> {
+    let mut next_config = state.config.lock().unwrap().clone();
+    next_config.reminders_paused = paused;
+    config::save_config(&next_config)?;
+    *state.config.lock().unwrap() = next_config;
+    Ok(())
 }
 
 #[tauri::command]
@@ -41,6 +70,25 @@ fn set_auto_start(enabled: bool) -> Result<(), String> {
 #[tauri::command]
 fn get_auto_start_status() -> bool {
     autostart::is_auto_start_enabled()
+}
+
+#[tauri::command]
+fn consume_pending_notification(
+    state: tauri::State<AppState>,
+) -> Option<PopupNotificationPayload> {
+    state.pending_notification.lock().unwrap().take()
+}
+
+#[tauri::command]
+fn set_reminders_paused(state: tauri::State<AppState>, paused: bool) -> Result<(), String> {
+    persist_reminders_paused(&state, paused)
+}
+
+#[tauri::command]
+fn get_reminder_countdowns(state: tauri::State<AppState>) -> Vec<ReminderCountdown> {
+    let config = state.config.lock().unwrap().clone();
+    let is_idle = idle::is_idle();
+    state.reminder_engine.get_countdowns(&config, is_idle)
 }
 
 #[tauri::command]
@@ -130,38 +178,103 @@ fn test_notification(
     show_notification(&app, &title, desc, &color, duration_minutes, &theme);
 }
 
+fn ensure_notification_window(app: &AppHandle) -> Result<WebviewWindow, String> {
+    if let Some(window) = app.get_webview_window("notification") {
+        return Ok(window);
+    }
+
+    WebviewWindowBuilder::new(app, "notification", WebviewUrl::App("notification.html".into()))
+        .title("Tempo Notification")
+        .inner_size(NOTIFICATION_WIDTH, NOTIFICATION_HEIGHT)
+        .resizable(false)
+        .decorations(false)
+        .transparent(true)
+        .always_on_top(true)
+        .visible(false)
+        .focused(false)
+        .skip_taskbar(true)
+        .build()
+        .map_err(|e| e.to_string())
+}
+
+fn place_notification_window(app: &AppHandle, window: &WebviewWindow) {
+    let monitor = window
+        .current_monitor()
+        .ok()
+        .flatten()
+        .or_else(|| app.primary_monitor().ok().flatten());
+
+    if let Some(monitor) = monitor {
+        let scale = monitor.scale_factor();
+        let size = monitor.size().to_logical::<f64>(scale);
+        let position = monitor.position().to_logical::<f64>(scale);
+        let x = position.x + (size.width - NOTIFICATION_WIDTH - NOTIFICATION_RIGHT_GAP).max(0.0);
+        let y = position.y
+            + (size.height - NOTIFICATION_HEIGHT - NOTIFICATION_BOTTOM_GAP).max(0.0);
+
+        let _ = window.set_size(LogicalSize::new(
+            NOTIFICATION_WIDTH,
+            NOTIFICATION_HEIGHT,
+        ));
+        let _ = window.set_position(LogicalPosition::new(x, y));
+    }
+}
+
 fn show_notification(
     app: &AppHandle,
     title: &str,
     description: Option<&str>,
-    _color: &str,
+    color: &str,
     duration_minutes: u32,
-    _theme: &str,
+    theme: &str,
 ) {
-    let body = description.unwrap_or("It is time to take a short break.");
-    if let Err(e) = app.notification().builder().title(title).body(body).show() {
-        eprintln!("Failed to show native notification: {}", e);
-        return;
+    let payload = PopupNotificationPayload {
+        title: title.to_string(),
+        description: description
+            .unwrap_or("It is time to take a short break.")
+            .to_string(),
+        color: color.to_string(),
+        duration_seconds: duration_minutes.saturating_mul(60).clamp(5, 600),
+        theme: theme.to_string(),
+    };
+
+    let notification_seq = {
+        let state = app.state::<AppState>();
+        let seq = state.notification_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        *state.pending_notification.lock().unwrap() = Some(payload.clone());
+        seq
+    };
+
+    let window = match ensure_notification_window(app) {
+        Ok(window) => window,
+        Err(e) => {
+            eprintln!("Failed to create notification window: {}", e);
+            return;
+        }
+    };
+
+    place_notification_window(app, &window);
+
+    if let Err(e) = window.emit("notification-payload", payload.clone()) {
+        eprintln!("Failed to emit notification payload: {}", e);
     }
 
-    // Native desktop notifications auto-dismiss quickly; re-fire to sustain visibility.
-    let repeat_count = duration_minutes.clamp(1, 10).saturating_sub(1);
-    if repeat_count == 0 {
+    if let Err(e) = window.show() {
+        eprintln!("Failed to show notification window: {}", e);
         return;
     }
 
     let app_handle = app.clone();
-    let title_owned = title.to_string();
-    let body_owned = body.to_string();
     std::thread::spawn(move || {
-        for _ in 0..repeat_count {
-            std::thread::sleep(std::time::Duration::from_secs(60));
-            let _ = app_handle
-                .notification()
-                .builder()
-                .title(&title_owned)
-                .body(&body_owned)
-                .show();
+        std::thread::sleep(std::time::Duration::from_secs(
+            payload.duration_seconds as u64 + 1,
+        ));
+        let state = app_handle.state::<AppState>();
+        let latest = state.notification_seq.load(Ordering::Relaxed);
+        if latest == notification_seq {
+            if let Some(window) = app_handle.get_webview_window("notification") {
+                let _ = window.hide();
+            }
         }
     });
 }
@@ -199,7 +312,14 @@ fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
                 });
             }
             "pause" => {
-                let _ = app.emit("toggle-pause", ());
+                let state = app.state::<AppState>();
+                let current = state.config.lock().unwrap().reminders_paused;
+                let next = !current;
+                if let Err(e) = persist_reminders_paused(&state, next) {
+                    eprintln!("Failed to update pause state: {}", e);
+                } else {
+                    let _ = app.emit("pause-state-changed", next);
+                }
             }
             _ => {}
         })
@@ -286,17 +406,27 @@ pub fn run() {
         reminder_engine: ReminderEngine::new(),
         db: Mutex::new(db),
         is_quitting: Mutex::new(false),
+        pending_notification: Mutex::new(None),
+        notification_seq: AtomicU64::new(0),
     };
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
-        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             load_config,
             save_config,
             set_auto_start,
             get_auto_start_status,
+            consume_pending_notification,
+            set_reminders_paused,
+            get_reminder_countdowns,
             get_idle_seconds,
             is_idle,
             get_today_active_minutes,
@@ -310,6 +440,7 @@ pub fn run() {
         .setup(|app| {
             setup_tray(app.handle())?;
             start_background_tasks(app.handle().clone());
+            let _ = ensure_notification_window(app.handle());
 
             let window = app.get_webview_window("main").unwrap();
             let window_clone = window.clone();

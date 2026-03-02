@@ -27,5 +27,5 @@ Thumbs.db
 
 # Local debugging / assistant artifacts
 .claude/
+.tools/
 qa/
-notification.html
